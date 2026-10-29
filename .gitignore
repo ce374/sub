@@ -52,3 +52,17 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Downloaded papers (runtime data, not source) — ignore contents but keep dir
+/download/*
+!/download/README.md
+
+# Local database (runtime data) — ignore contents but keep dir
+/db/*
+!/db/.gitkeep
+
+# Staging dirs for zip
+.staging-*
+
+# Partial downloads
+*.partial
