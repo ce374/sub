@@ -127,3 +127,9 @@
 ::-webkit-scrollbar-thumb { background: #d4d4d4; border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #b0b0b0; }
 * { scrollbar-width: thin; scrollbar-color: #d4d4d4 transparent; }
+
+/* ===== Pulse animation for download status dot ===== */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}

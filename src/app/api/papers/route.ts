@@ -350,14 +350,92 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
 
-    // single download via libgen.li (curl)
+    // single download via libgen.li (curl) — STREAMING so the UI can show
+    // sub-status (searching → fetching → downloading) instead of a flat "…"
     if (body.action === 'download') {
       const doi = parseDoiInput(body.doi)
       if (!doi) return NextResponse.json({ success: false, reason: 'NO_DOI', error: 'no doi' }, { status: 400 })
-      const r = await libgenDownloadPaper(doi)
-      if (!r.success) return NextResponse.json({ success: false, reason: 'LIBGEN_FAILED', error: r.error })
-      await markDownloaded(doi, body.title || doi, r.filename)
-      return NextResponse.json({ success: true, filename: r.filename, size: r.size })
+      const title = typeof body.title === 'string' && body.title ? body.title : doi
+      const filename = `${safeFilename(doi)}.pdf`
+      const target = path.join(DOWNLOAD_DIR, filename)
+
+      const encoder = new TextEncoder()
+      const stream = new ReadableStream({
+        async start(controller) {
+          const send = (obj: any) => {
+            try { controller.enqueue(encoder.encode(JSON.stringify(obj) + '\n')) } catch {}
+          }
+          try {
+            await fs.mkdir(DOWNLOAD_DIR, { recursive: true })
+
+            // cached?
+            if (existsSync(target)) {
+              const st = await fs.stat(target)
+              await markDownloaded(doi, title, filename)
+              send({ type: 'done', doi, filename, size: st.size, cached: true })
+              controller.close()
+              return
+            }
+
+            // Step 1: search
+            send({ type: 'step', doi, step: 'search', label: 'searching libgen.li' })
+            const editionId = await libgenSearchEdition(doi)
+            if (!editionId) {
+              send({ type: 'error', doi, reason: 'LIBGEN_FAILED', error: 'not on libgen.li (no edition)' })
+              controller.close(); return
+            }
+
+            // Step 2: edition → md5
+            send({ type: 'step', doi, step: 'edition', label: 'found · fetching metadata' })
+            const md5Info = await libgenGetMd5(editionId)
+            if (!md5Info) {
+              send({ type: 'error', doi, reason: 'LIBGEN_FAILED', error: 'no md5 on edition page' })
+              controller.close(); return
+            }
+
+            // Step 3: ads → download URL
+            send({ type: 'step', doi, step: 'ads', label: 'resolving download link' })
+            const dlUrl = await libgenGetDownloadUrl(md5Info.md5, md5Info.downloadname)
+            if (!dlUrl) {
+              send({ type: 'error', doi, reason: 'LIBGEN_FAILED', error: 'no download link on ads page' })
+              controller.close(); return
+            }
+
+            // Step 4: download the PDF
+            send({ type: 'step', doi, step: 'download', label: 'downloading pdf' })
+            const partial = `${target}.partial`
+            try { await fs.unlink(partial) } catch {}
+            const adsReferer = `${LIBGEN_BASE}/ads.php?md5=${md5Info.md5}`
+            const { size, error: dlError } = await curlDownload(dlUrl, partial, adsReferer)
+            if (size === 0) {
+              try { await fs.unlink(partial) } catch {}
+              send({ type: 'error', doi, reason: 'LIBGEN_FAILED', error: dlError || 'download empty' })
+              controller.close(); return
+            }
+            // verify %PDF magic
+            const fd = await fs.open(partial, 'r')
+            const buf = Buffer.alloc(5)
+            await fd.read(buf, 0, 5, 0)
+            await fd.close()
+            if (buf.toString('ascii') !== '%PDF-') {
+              const snippet = (await fs.readFile(partial, 'utf8').catch(() => '')).slice(0, 200)
+              try { await fs.unlink(partial) } catch {}
+              send({ type: 'error', doi, reason: 'LIBGEN_FAILED', error: `not a PDF: ${snippet.replace(/\s+/g, ' ').slice(0, 120)}` })
+              controller.close(); return
+            }
+            await fs.rename(partial, target)
+            await markDownloaded(doi, title, filename)
+            send({ type: 'done', doi, filename, size })
+          } catch (e: any) {
+            send({ type: 'error', doi, reason: 'EXCEPTION', error: e?.message || String(e) })
+          }
+          controller.close()
+        },
+      })
+
+      return new NextResponse(stream, {
+        headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' },
+      })
     }
 
     // ---- Folder-aware bulk download (libgen.li via curl) ----

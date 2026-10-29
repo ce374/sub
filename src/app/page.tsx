@@ -22,6 +22,9 @@ type Paper = {
 type DLState = 'idle' | 'resolving' | 'done' | 'failed'
 type Mode = 'main' | 'classics'
 
+// Sub-status shown while resolving (e.g. "searching libgen.li", "downloading pdf")
+type DLSub = { label: string; startedAt: number } | null
+
 type BulkProgress = {
   completedFolders: number
   totalFolders: number
@@ -34,8 +37,8 @@ type BulkProgress = {
 const safeFilename = (doi: string) => doi.replaceAll(/[^A-Za-z0-9._-]/g, '_')
 
 // filename-style row — FULL title (wraps), state button, nothing else
-function PaperRow({ paper, state, error, selected, onDownload, onPress, onClick, showFolder }: {
-  paper: Paper; state: DLState; error?: string; selected: boolean
+function PaperRow({ paper, state, error, sub, selected, onDownload, onPress, onClick, showFolder }: {
+  paper: Paper; state: DLState; error?: string; sub?: DLSub; selected: boolean
   onDownload: () => void; onPress: (p: Paper) => void; onClick: (p: Paper) => void
   showFolder?: boolean
 }) {
@@ -58,9 +61,6 @@ function PaperRow({ paper, state, error, selected, onDownload, onPress, onClick,
   const btnColor = state === 'done' ? C.green : state === 'failed' ? C.red : state === 'resolving' ? C.orange : C.idle
   const btnLabel = state === 'done' ? 'open' : state === 'failed' ? '—' : state === 'resolving' ? '…' : 'get'
   const folderPath = showFolder && paper.folders && paper.folders.length > 0 ? paper.folders.join('/') : ''
-  // When the file is downloaded, render the action as a real <a> link so the
-  // browser opens/downloads it via native navigation (can't be blocked by
-  // popup blockers or sandbox restrictions the way a JS click() can).
   const openHref = state === 'done' ? `/api/papers?action=open&file=${encodeURIComponent(`${safeFilename(paper.doi)}.pdf`)}` : ''
   const actionStyle: React.CSSProperties = {
     background: btnColor, color: '#fff', border: 'none', padding: '2px 6px', fontSize: 10,
@@ -73,6 +73,7 @@ function PaperRow({ paper, state, error, selected, onDownload, onPress, onClick,
   ) : (
     <button onClick={(e) => { e.stopPropagation(); onDownload() }} disabled={state === 'resolving'} style={actionStyle}>{btnLabel}</button>
   )
+  const elapsed = sub ? Math.max(0, Math.round((Date.now() - sub.startedAt) / 1000)) : 0
   return (
     <div onPointerDown={down} onPointerMove={move} onPointerUp={cancel} onPointerLeave={cancel} onPointerCancel={cancel} onClick={click}
       style={{ borderBottom: `1px solid ${C.border}`, background: selected ? C.selBg : C.bg, cursor: 'pointer', userSelect: 'none', WebkitUserSelect: 'none', touchAction: 'pan-y' }}>
@@ -81,6 +82,13 @@ function PaperRow({ paper, state, error, selected, onDownload, onPress, onClick,
         <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: C.text, lineHeight: 1.35, wordBreak: 'break-word', whiteSpace: 'normal' }}>{paper.title}</div>
         {actionEl}
       </div>
+      {state === 'resolving' && sub && (
+        <div style={{ padding: '0 9px 5px', fontSize: 9, color: C.orange, fontFamily: mono, display: 'flex', gap: 5, alignItems: 'center' }}>
+          <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: C.orange, animation: 'pulse 1s ease-in-out infinite' }} />
+          <span>{sub.label}</span>
+          <span style={{ color: C.dim }}>·{elapsed}s</span>
+        </div>
+      )}
       {folderPath && (
         <div style={{ padding: '0 9px 4px', fontSize: 9, color: C.dim, fontFamily: mono, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>→ {folderPath}</div>
       )}
@@ -195,6 +203,15 @@ export default function Home() {
   // shared download state
   const [dlStates, setDlStates] = useState<Record<string, DLState>>({})
   const [dlErrors, setDlErrors] = useState<Record<string, string>>({})
+  const [dlSubs, setDlSubs] = useState<Record<string, DLSub>>({})
+  // 1-second tick to re-render elapsed time while any download is resolving
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const hasResolving = Object.values(dlStates).some(s => s === 'resolving')
+    if (!hasResolving) return
+    const id = setInterval(() => setTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [dlStates])
 
   // selection
   const [selecting, setSelecting] = useState(false)
@@ -232,15 +249,37 @@ export default function Home() {
   const setDl = (doi: string, s: DLState, err?: string) => {
     setDlStates(p => ({ ...p, [doi]: s }))
     if (err !== undefined) setDlErrors(p => ({ ...p, [doi]: err }))
+    if (s !== 'resolving') setDlSubs(p => { const n = { ...p }; delete n[doi]; return n })
   }
 
   const singleDownload = async (paper: Paper) => {
     setDl(paper.doi, 'resolving')
+    setDlSubs(p => ({ ...p, [paper.doi]: { label: 'starting', startedAt: Date.now() } }))
     try {
       const res = await fetch('/api/papers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'download', doi: paper.doi, title: paper.title }) })
-      const data = await res.json()
-      if (data.success) { setDl(paper.doi, 'done'); showToast(`got ${data.filename}`) }
-      else setDl(paper.doi, 'failed', `${data.reason || 'failed'}: ${data.error || ''}`.slice(0, 160))
+      const reader = res.body!.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n'); buf = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const ev = JSON.parse(line)
+            if (ev.type === 'step' && ev.doi === paper.doi) {
+              setDlSubs(p => ({ ...p, [paper.doi]: { label: ev.label || ev.step, startedAt: Date.now() } }))
+            } else if (ev.type === 'done' && ev.doi === paper.doi) {
+              setDl(ev.doi, 'done')
+              showToast(`got ${ev.filename}`)
+            } else if (ev.type === 'error' && ev.doi === paper.doi) {
+              setDl(ev.doi, 'failed', `${ev.reason || 'failed'}: ${ev.error || ''}`.slice(0, 160))
+            }
+          } catch {}
+        }
+      }
     } catch (e: any) { setDl(paper.doi, 'failed', e?.message || String(e)) }
   }
 
@@ -356,7 +395,7 @@ export default function Home() {
   })
 
   const renderRow = (p: Paper, opts: { showFolder?: boolean } = {}) => (
-    <PaperRow key={p.doi} paper={p} state={dlStates[p.doi] || 'idle'} error={dlErrors[p.doi]}
+    <PaperRow key={p.doi} paper={p} state={dlStates[p.doi] || 'idle'} error={dlErrors[p.doi]} sub={dlSubs[p.doi]}
       selected={selected.has(p.doi)}
       onDownload={() => singleDownload(p)} onPress={onPress} onClick={onCardClick} showFolder={opts.showFolder} />
   )
